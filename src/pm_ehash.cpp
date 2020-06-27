@@ -1,12 +1,35 @@
 #include"pm_ehash.h"
-//for test
+
+bool if_has_free_slot(pm_bucket *bucket)
+{
+    for(int i = 0; i < 7; ++i)
+    {
+        if(!((bucket->bitmap[0] >> i) & 1))
+            return true;
+    }
+    for(int i = 0; i < 6; ++i)      //bitmap[1]最后一位不对应槽    {
+    {
+        if(!((bucket->bitmap[1] >> i) & 1))
+            return true;
+    }
+    return false;
+}
+
 /**
  * @description: construct a new instance of PmEHash in a default directory
  * @param NULL
  * @return: new instance of PmEHash
  */
 PmEHash::PmEHash() {
-
+    if()
+    {
+        
+    }
+    else
+    {
+        recover();
+        mapAllPage();
+    }
 }
 /**
  * @description: persist and munmap all data in NVM
@@ -29,12 +52,25 @@ int PmEHash::insert(kv new_kv_pair) {
     else
     {
         pm_bucket * bucket = getFreeBucket(new_kv_pair.key);
-        int slot_num = 0;
-        for(slot_num; bucket->slot[slot_num].key == -1; ++ slot_num)  //找到空槽
+        int i, j;             //i选择bitmap[0]或bitmap[1]，j选择bitmap[i]中的第几个bit
+        int stop_for = 0;
+        for(i = 0; i < 1; ++i)
+        {
+            for(j = 0; j < 7; ++j)
+            {
+                if(!((bucket->bitmap[i] >> j) & 1))
+                {
+                    stop_for = 1;
+                    break;
+                }
+            }
+            if(stop_for)
+                break;
+        }
+        int slot_num = i * 8 + j;  //根据i和j算出第几个槽是空的
         bucket->slot[slot_num].key = new_kv_pair.key;
         bucket->slot[slot_num].value = new_kv_pair.value;
-        int offset = slot_num % 8;
-        bucket->bitmap[slot_num / 8] |= (1 << offset);        //对应位置1
+        bucket->bitmap[i] |= (1 << j);        //位图中对应位置1
         return 0;
     }
 }
@@ -57,10 +93,12 @@ int PmEHash::remove(uint64_t key) {
             if(bucket->slot[i].key == key)
             {
                 int offset = i % 8;
-                bucket->bitmap[i / 8] &= (~(1 << offset));  //对应位置0
+                bucket->bitmap[i / 8] &= (~(1 << offset));  //位图中对应位置0
                 break;
             }
         }
+        if(bucket->bitmap[0] == 0 && bucket->bitmap[1] == 0)   //如果删除后使得桶变空，则需要回收空桶
+            mergeBucket(bucket_num);
         return 0;
     }
 }
@@ -124,7 +162,15 @@ uint64_t PmEHash::hashFunc(uint64_t key) {
  * @return: 空闲桶的虚拟地址
  */
 pm_bucket* PmEHash::getFreeBucket(uint64_t key) {
-
+    uint64_t bucket_num = hashFunc(key);
+    pm_bucket * bucket = catalog.buckets_virtual_address[bucket_num];
+    if(!if_has_free_slot(bucket))
+    {
+        splitBucket(bucket_num);
+        bucket_num = hashFunc(key);  //重新哈希找桶
+        bucket = catalog.buckets_virtual_address[bucket_num];
+    }
+    return bucket;
 }
 
 /**
@@ -134,9 +180,23 @@ pm_bucket* PmEHash::getFreeBucket(uint64_t key) {
  */
 kv* PmEHash::getFreeKvSlot(pm_bucket* bucket) {
     kv * freeslot;
-    int slot_num = 0;
-    for(slot_num; bucket->slot[slot_num].key == -1; ++ slot_num)
-    freeslot = &bucket->slot[slot_num];
+    int i, j;     //i选择bitmap[0]或bitmap[1]，j选择bitmap[i]中的第几个bit
+    int stop_for = 0;
+    for(i = 0; i < 1; ++i)
+    {
+        for(j = 0; j < 7; ++j)
+        {
+            if(!((bucket->bitmap[i] >> j) & 1))
+            {
+                stop_for = 1;
+                break;
+            }
+        }
+        if(stop_for)
+            break;
+    }
+    int slot_num = i * 8 + j;  //根据i和j算出第几个槽是空的
+    freeslot = & bucket->slot[slot_num];
     return freeslot;
 }
 
@@ -146,7 +206,35 @@ kv* PmEHash::getFreeKvSlot(pm_bucket* bucket) {
  * @return: NULL
  */
 void PmEHash::splitBucket(uint64_t bucket_id) {
-
+    pm_bucket * full_bucket = catalog.buckets_virtual_address[bucket_id];
+    ++ catalog.buckets_virtual_address[bucket_id]->local_depth;
+    if(catalog.buckets_virtual_address[bucket_id]->local_depth > metadata->global_depth)
+        extendCatalog();          //桶的局部深度大于全局深度时要倍增目录
+    pm_bucket * new_bucket;
+    if(free_list.empty())
+    {
+        pm_address address;
+        getFreeSlot(address);
+        new_bucket = pmAddr2vAddr[address];
+    }
+    else
+    {
+        new_bucket = free_list.front(); //先取出队列头部元素再将其删除
+        free_list.pop();
+    }
+    new_bucket->bitmap[0] = 0;
+    new_bucket->bitmap[1] = 0;
+    new_bucket->local_depth = full_bucket->local_depth;
+    kv old_data[15];
+    for(int i = 0; i < 15; ++i)    //将已满桶的记录先复制下来
+    {
+        old_data[i].key = full_bucket->slot[i].key;
+        old_data[i].value = full_bucket->slot[i].value;
+    }
+    full_bucket->bitmap[0] = 0;
+    full_bucket->bitmap[1] = 0;    //将位图全部置0
+    for(int i = 0; i < 15; ++i)
+        insert(old_data[i]);       //重新分布已满桶中的记录
 }
 
 /**
@@ -182,7 +270,8 @@ void* PmEHash::getFreeSlot(pm_address& new_address) {
  * @return: NULL
  */
 void PmEHash::allocNewPage() {
-
+    ++ metadata->max_file_id;
+    
 }
 
 /**
